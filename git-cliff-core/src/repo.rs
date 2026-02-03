@@ -137,6 +137,14 @@ impl Repository {
         &self.path
     }
 
+    /// Returns the path to the `.git` directory.
+    ///
+    /// This is used for storing cache files like the GitHub data cache.
+    #[must_use]
+    pub fn git_dir(&self) -> PathBuf {
+        self.inner.path().to_path_buf()
+    }
+
     /// Sets the range for the commit search.
     ///
     /// When a single SHA is provided as the range, start from the

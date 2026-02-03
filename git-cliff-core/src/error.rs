@@ -102,6 +102,9 @@ pub enum Error {
     /// Error that may occur when a remote is not set.
     #[error("Repository remote is not set.")]
     RemoteNotSetError,
+    /// Error that may occur when a remote API returns an error.
+    #[error("Remote API error: {0}")]
+    RemoteApiError(String),
     /// Error that may occur while handling location of directories.
     #[error("Directory error: `{0}`")]
     DirsError(String),

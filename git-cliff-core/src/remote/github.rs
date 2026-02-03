@@ -1,8 +1,11 @@
+use std::path::Path;
+
 use async_stream::stream as async_stream;
 use futures::{Stream, StreamExt, stream};
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 
+use super::cache::{CachedCommit, CachedPullRequest, GitHubCache};
 use super::*;
 use crate::config::Remote;
 use crate::error::*;
@@ -83,6 +86,8 @@ pub struct GitHubPullRequest {
     pub merge_commit_sha: Option<String>,
     /// Labels of the pull request.
     pub labels: Vec<PullRequestLabel>,
+    /// Last updated timestamp (RFC3339 format).
+    pub updated_at: Option<String>,
 }
 
 impl RemotePullRequest for GitHubPullRequest {
@@ -244,6 +249,246 @@ impl GitHubClient {
                 }
             }
         }
+    }
+
+    // ========== Cache-aware methods ==========
+
+    /// Constructs the URL for GitHub pull requests API with sorting by updated_at.
+    /// This is used for incremental fetching.
+    fn pull_requests_url_sorted(
+        api_url: &str,
+        remote: &Remote,
+        page: i32,
+        since: Option<&str>,
+    ) -> String {
+        let mut url = format!(
+            "{}/repos/{}/{}/pulls?per_page={MAX_PAGE_SIZE}&page={page}&state=closed&sort=updated&direction=desc",
+            api_url, remote.owner, remote.repo
+        );
+
+        if let Some(since) = since {
+            url.push_str(&format!("&since={}", urlencoding::encode(since)));
+        }
+
+        url
+    }
+
+    /// Constructs the URL for GitHub commits API with since parameter.
+    fn commits_url_since(
+        api_url: &str,
+        remote: &Remote,
+        ref_name: Option<&str>,
+        page: i32,
+        since: Option<&str>,
+    ) -> String {
+        let mut url = format!(
+            "{}/repos/{}/{}/commits?per_page={MAX_PAGE_SIZE}&page={page}",
+            api_url, remote.owner, remote.repo
+        );
+
+        if let Some(ref_name) = ref_name {
+            url.push_str(&format!("&sha={ref_name}"));
+        }
+
+        if let Some(since) = since {
+            url.push_str(&format!("&since={}", urlencoding::encode(since)));
+        }
+
+        url
+    }
+
+    /// Fetches commits and pull requests using cache for incremental updates.
+    ///
+    /// This method:
+    /// 1. Loads existing cache from the git directory
+    /// 2. Fetches only new/updated data since the last cache update
+    /// 3. Merges the new data with the cache
+    /// 4. Saves the updated cache
+    /// 5. Returns all data as trait objects
+    pub async fn get_commits_and_prs_cached(
+        &self,
+        git_dir: &Path,
+        ref_name: Option<&str>,
+    ) -> Result<(Vec<Box<dyn RemoteCommit>>, Vec<Box<dyn RemotePullRequest>>)> {
+        let mut cache = GitHubCache::load(git_dir);
+        let since = cache.get_since_timestamp().map(|s| s.to_string());
+
+        let (cached_commits, cached_prs) = cache.stats();
+        if since.is_some() {
+            log::info!(
+                "Using GitHub cache with {} commits and {} PRs (last updated: {})",
+                cached_commits,
+                cached_prs,
+                since.as_deref().unwrap_or("unknown")
+            );
+        }
+
+        // Fetch new commits
+        let new_commits = self
+            .fetch_commits_since(ref_name, since.as_deref())
+            .await?;
+        log::debug!("Fetched {} new commits from GitHub API", new_commits.len());
+
+        // Update cache with new commits
+        for commit in &new_commits {
+            cache.commits.insert(
+                commit.sha.clone(),
+                CachedCommit {
+                    sha: commit.sha.clone(),
+                    author_login: commit.author.as_ref().and_then(|a| a.login.clone()),
+                    date: commit.commit.as_ref().map(|c| c.author.date.clone()),
+                },
+            );
+        }
+
+        // Fetch new/updated PRs
+        let new_prs = self.fetch_prs_since(since.as_deref()).await?;
+        log::debug!(
+            "Fetched {} new/updated PRs from GitHub API",
+            new_prs.len()
+        );
+
+        // Update cache with new/updated PRs
+        for pr in &new_prs {
+            cache.pull_requests.insert(
+                pr.number,
+                CachedPullRequest {
+                    number: pr.number,
+                    title: pr.title.clone(),
+                    merge_commit_sha: pr.merge_commit_sha.clone(),
+                    labels: pr.labels.iter().map(|l| l.name.clone()).collect(),
+                    updated_at: pr.updated_at.clone(),
+                },
+            );
+        }
+
+        // Update timestamp and save cache
+        cache.update_timestamp();
+        if let Err(e) = cache.save(git_dir) {
+            log::warn!("Failed to save GitHub cache: {}", e);
+        }
+
+        // Convert cache to trait objects
+        let commits: Vec<Box<dyn RemoteCommit>> = cache
+            .commits
+            .values()
+            .map(|c| {
+                Box::new(GitHubCommit {
+                    sha: c.sha.clone(),
+                    author: c.author_login.as_ref().map(|login| GitHubCommitAuthor {
+                        login: Some(login.clone()),
+                    }),
+                    commit: c.date.as_ref().map(|date| GitHubCommitDetails {
+                        author: GitHubCommitDetailsAuthor { date: date.clone() },
+                    }),
+                }) as Box<dyn RemoteCommit>
+            })
+            .collect();
+
+        let prs: Vec<Box<dyn RemotePullRequest>> = cache
+            .pull_requests
+            .values()
+            .map(|p| {
+                Box::new(GitHubPullRequest {
+                    number: p.number,
+                    title: p.title.clone(),
+                    merge_commit_sha: p.merge_commit_sha.clone(),
+                    labels: p
+                        .labels
+                        .iter()
+                        .map(|name| PullRequestLabel { name: name.clone() })
+                        .collect(),
+                    updated_at: p.updated_at.clone(),
+                }) as Box<dyn RemotePullRequest>
+            })
+            .collect();
+
+        let (final_commits, final_prs) = (commits.len(), prs.len());
+        log::info!(
+            "GitHub cache now has {} commits and {} PRs",
+            final_commits,
+            final_prs
+        );
+
+        Ok((commits, prs))
+    }
+
+    /// Fetches commits since the given timestamp.
+    async fn fetch_commits_since(
+        &self,
+        ref_name: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<GitHubCommit>> {
+        let mut all_commits = Vec::new();
+        let mut page = 0;
+
+        loop {
+            let url = Self::commits_url_since(
+                &self.api_url(),
+                &self.remote(),
+                ref_name,
+                page,
+                since,
+            );
+            let commits: Vec<GitHubCommit> = self.get_json(&url).await?;
+
+            if commits.is_empty() {
+                break;
+            }
+
+            all_commits.extend(commits);
+            page += 1;
+        }
+
+        Ok(all_commits)
+    }
+
+    /// Fetches PRs updated since the given timestamp.
+    /// Uses sort=updated&direction=desc to stop early when we reach PRs
+    /// that haven't been updated since our last fetch.
+    async fn fetch_prs_since(&self, since: Option<&str>) -> Result<Vec<GitHubPullRequest>> {
+        let mut all_prs = Vec::new();
+        let mut page = 0;
+
+        loop {
+            let url = Self::pull_requests_url_sorted(
+                &self.api_url(),
+                &self.remote(),
+                page,
+                None, // GitHub PRs API doesn't support 'since' parameter directly
+            );
+            let prs: Vec<GitHubPullRequest> = self.get_json(&url).await?;
+
+            if prs.is_empty() {
+                break;
+            }
+
+            // If we have a since timestamp, check if we've reached PRs
+            // that haven't been updated since then
+            if let Some(since_ts) = since {
+                let mut found_old_pr = false;
+                for pr in prs {
+                    if let Some(ref updated_at) = pr.updated_at {
+                        if updated_at.as_str() < since_ts {
+                            // This PR and all following are older than our cache
+                            found_old_pr = true;
+                            break;
+                        }
+                    }
+                    all_prs.push(pr);
+                }
+                if found_old_pr {
+                    break;
+                }
+            } else {
+                // No since timestamp, fetch all PRs
+                all_prs.extend(prs);
+            }
+
+            page += 1;
+        }
+
+        Ok(all_prs)
     }
 }
 

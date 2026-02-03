@@ -754,6 +754,7 @@ pub fn run_with_changelog_modifier<'a>(
         };
         let mut releases = Vec::<Release>::new();
         let mut commit_range = None;
+        let mut git_dir = None;
         for repository in repositories {
             // Skip commits
             let mut skip_list = Vec::new();
@@ -784,13 +785,17 @@ pub fn run_with_changelog_modifier<'a>(
             // repository.
             commit_range = determine_commit_range(&args, &config, &repository)?;
 
+            // Store the git directory for caching remote data.
+            // Like commit_range, we use the last repository's git directory.
+            git_dir = Some(repository.git_dir());
+
             releases.extend(process_repository(
                 Box::leak(Box::new(repository)),
                 &mut config,
                 &args,
             )?);
         }
-        Changelog::new(releases, config, commit_range.as_deref())?
+        Changelog::new_with_git_dir(releases, config, commit_range.as_deref(), git_dir)?
     };
     changelog_modifier(&mut changelog)?;
 

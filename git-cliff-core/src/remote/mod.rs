@@ -1,3 +1,7 @@
+/// Cache for remote data.
+#[cfg(feature = "remote")]
+pub mod cache;
+
 /// GitHub client.
 #[cfg(feature = "github")]
 pub mod github;
@@ -170,16 +174,20 @@ pub trait RemoteClient {
     async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
         log::debug!("Sending request to: {url}");
         let response = self.client().get(url).send().await?;
-        let response_text = if response.status().is_success() {
+        if response.status().is_success() {
             let text = response.text().await?;
             log::trace!("Response: {text:?}");
-            text
+            Ok(serde_json::from_str::<T>(&text)?)
         } else {
+            let status = response.status();
             let text = response.text().await?;
-            log::error!("Request error: {text}");
-            text
-        };
-        Ok(serde_json::from_str::<T>(&response_text)?)
+            log::error!("Request error ({}): {}", status, text);
+            Err(Error::RemoteApiError(format!(
+                "GitHub API returned {}: {}",
+                status,
+                text.chars().take(200).collect::<String>()
+            )))
+        }
     }
 }
 

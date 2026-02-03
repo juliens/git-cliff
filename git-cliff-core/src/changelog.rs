@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::commit::Commit;
@@ -30,13 +31,28 @@ pub struct Changelog<'a> {
     body_template: Template,
     footer_template: Option<Template>,
     additional_context: HashMap<String, serde_json::Value>,
+    /// Path to the `.git` directory for caching remote data.
+    git_dir: Option<PathBuf>,
 }
 
 impl<'a> Changelog<'a> {
     /// Constructs a new instance.
     pub fn new(releases: Vec<Release<'a>>, config: Config, range: Option<&str>) -> Result<Self> {
+        Self::new_with_git_dir(releases, config, range, None)
+    }
+
+    /// Constructs a new instance with a git directory for caching remote data.
+    ///
+    /// When `git_dir` is provided, GitHub metadata will be cached in
+    /// `.git/git-cliff-core/github_cache.json` for faster subsequent runs.
+    pub fn new_with_git_dir(
+        releases: Vec<Release<'a>>,
+        config: Config,
+        range: Option<&str>,
+        git_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         let is_offline = config.remote.offline;
-        let mut changelog = Changelog::build(releases, config)?;
+        let mut changelog = Changelog::build(releases, config, git_dir)?;
 
         // Always add context, but only add data if we are running in online mode.
         changelog.add_remote_context()?;
@@ -50,7 +66,11 @@ impl<'a> Changelog<'a> {
     }
 
     /// Builds a changelog from releases and config.
-    fn build(releases: Vec<Release<'a>>, config: Config) -> Result<Self> {
+    fn build(
+        releases: Vec<Release<'a>>,
+        config: Config,
+        git_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         let trim = config.changelog.trim;
         Ok(Self {
             releases,
@@ -65,12 +85,13 @@ impl<'a> Changelog<'a> {
             },
             config,
             additional_context: HashMap::new(),
+            git_dir,
         })
     }
 
     /// Constructs an instance from a serialized context object.
     pub fn from_context<R: Read>(input: &mut R, config: Config) -> Result<Self> {
-        Changelog::build(serde_json::from_reader(input)?, config)
+        Changelog::build(serde_json::from_reader(input)?, config, None)
     }
 
     /// Adds a key value pair to the template context.
@@ -303,6 +324,10 @@ impl<'a> Changelog<'a> {
     /// Each of these are paginated requests so they are being run in parallel
     /// for speedup.
     ///
+    /// When a git directory is available, this uses caching to only fetch
+    /// new/updated data since the last run, significantly speeding up
+    /// subsequent changelog generations.
+    ///
     /// If no GitHub related variable is used in the template then this function
     /// returns empty vectors.
     #[cfg(feature = "github")]
@@ -321,17 +346,29 @@ impl<'a> Changelog<'a> {
                 github::START_FETCHING_MSG,
                 self.config.remote.github
             );
+
             let data = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
                 .block_on(async {
-                    let (commits, pull_requests) = tokio::try_join!(
-                        github_client.get_commits(ref_name),
-                        github_client.get_pull_requests(),
-                    )?;
-                    log::debug!("Number of GitHub commits: {}", commits.len());
-                    log::debug!("Number of GitHub pull requests: {}", pull_requests.len());
-                    Ok((commits, pull_requests))
+                    // Use cached fetching when git_dir is available
+                    if let Some(ref git_dir) = self.git_dir {
+                        let (commits, pull_requests) = github_client
+                            .get_commits_and_prs_cached(git_dir, ref_name)
+                            .await?;
+                        log::debug!("Number of GitHub commits: {}", commits.len());
+                        log::debug!("Number of GitHub pull requests: {}", pull_requests.len());
+                        Ok((commits, pull_requests))
+                    } else {
+                        // Fall back to non-cached fetching
+                        let (commits, pull_requests) = tokio::try_join!(
+                            github_client.get_commits(ref_name),
+                            github_client.get_pull_requests(),
+                        )?;
+                        log::debug!("Number of GitHub commits: {}", commits.len());
+                        log::debug!("Number of GitHub pull requests: {}", pull_requests.len());
+                        Ok((commits, pull_requests))
+                    }
                 });
             log::info!("{}", github::FINISHED_FETCHING_MSG);
             data
@@ -576,6 +613,16 @@ impl<'a> Changelog<'a> {
             Some("HEAD") => None,
             other => other,
         };
+
+        // Strip remote prefix from ref name (e.g., "upstream/v3.6" -> "v3.6")
+        // GitHub API doesn't understand local tracking branch references
+        let ref_name = ref_name.map(|r| {
+            if let Some(pos) = r.find('/') {
+                &r[pos + 1..]
+            } else {
+                r
+            }
+        });
 
         #[cfg(feature = "github")]
         let (github_commits, github_pull_requests) = if self.config.remote.github.is_set() {

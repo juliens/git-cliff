@@ -570,6 +570,7 @@ mod test {
                     labels: vec![PullRequestLabel {
                         name: String::from("rust"),
                     }],
+                    ..Default::default()
                 },
                 GitHubPullRequest {
                     title: Some(String::from("2")),
@@ -580,6 +581,7 @@ mod test {
                     labels: vec![PullRequestLabel {
                         name: String::from("rust"),
                     }],
+                    ..Default::default()
                 },
                 GitHubPullRequest {
                     title: Some(String::from("3")),
@@ -590,6 +592,7 @@ mod test {
                     labels: vec![PullRequestLabel {
                         name: String::from("deps"),
                     }],
+                    ..Default::default()
                 },
                 GitHubPullRequest {
                     title: Some(String::from("4")),
@@ -600,6 +603,7 @@ mod test {
                     labels: vec![PullRequestLabel {
                         name: String::from("deps"),
                     }],
+                    ..Default::default()
                 },
                 GitHubPullRequest {
                     title: Some(String::from("5")),
@@ -610,6 +614,7 @@ mod test {
                     labels: vec![PullRequestLabel {
                         name: String::from("github"),
                     }],
+                    ..Default::default()
                 },
             ]
             .into_iter()
